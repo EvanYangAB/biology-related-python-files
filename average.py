@@ -1,207 +1,240 @@
-# with open("39033.bigwig", "rb") as binary_file:
-#     # Seek position and read N bytes
-#     binary_file.seek(0)  # Go to beginning
-#     couple_bytes = binary_file.read(65)
-#     print(couple_bytes)
-# print(123)
 import struct
 import zlib
-f = open("39033.bigwig", "rb")
-data = f.read(36)
-(magic, version, zoomLevels, chromosomeTreeOffset, fullDataOffset, fullIndexOffset,
-	fieldCount, definedFieldCount
-	) = struct.unpack("=IHHQQQHH", data)
+
+Enddian = "="
+compressed = True
+zoomOffset = 0
+
+def readRtreeNode(f, offset, isLeaf):
+    f.seek(offset)
+    data = f.read(4)
+    (rIsLeaf, rReserved, rCount) = struct.unpack(Enddian + "BBH", data)
+    if isLeaf:
+        data = f.read(32)
+        (rStartChromIx, rStartBase, rEndChromIx, rEndBase, rdataOffset, rDataSize) = struct.unpack(Enddian + "IIIIQQ", data)
+        return {"rIsLeaf": rIsLeaf, "rReserved": rReserved, "rCount": rCount, "rStartChromIx": rStartChromIx, "rStartBase": rStartBase, "rEndChromIx": rEndChromIx, "rEndBase": rEndBase, "rdataOffset": rdataOffset, "rDataSize": rDataSize, "nextOff": offset + 32}
+    else:
+        data = f.read(24)
+        (rStartChromIx, rStartBase, rEndChromIx, rEndBase, rdataOffset) = struct.unpack(Enddian + "IIIIQ", data)
+        return {"rIsLeaf": rIsLeaf, "rReserved": rReserved, "rCount": rCount, "rStartChromIx": rStartChromIx, "rStartBase": rStartBase, "rEndChromIx": rEndChromIx, "rEndBase": rEndBase, "rdataOffset": rdataOffset, "nextOff": offset + 24}
+
+# read 1 r tree head node
+def readRtreeHeadNode(f, offset):
+    f.seek(offset)
+    data = f.read(4)
+    (rIsLeaf, rReserved, rCount) = struct.unpack(Enddian + "BBH", data)
+    return readRtreeNode(f, offset, rIsLeaf)
+    
 
 
-data = f.read(20)
-(autoSqlOffset, totalSummaryOffset, uncompressBufSize) = struct.unpack("=QQI", data)
+# returns (startIndex, [(startIndex, endIndex, average)s])
+def grepSections(f, dataOffest, dataSize, startIndex, endIndex):
+    f.seek(dataOffest)
+    data = f.read(dataSize)
+    decom = zlib.decompress(data) if compressed else data
+    if zoomOffset:
+        result = []
+        itemCount = len(decom)/32
+    else:
+        header = decom[:24]
+        result = []
+        (chromId, chromStart, chromEnd, itemStep, itemSpan, 
+            iType, _, itemCount) = struct.unpack(Enddian + "IIIIIBBH", header)
+    x = 0
+    while x < itemCount and startIndex < endIndex:
+        # zoom summary
+        if zoomOffset:
+            (_, start, end, _, minVal, maxVal, sumData, sumSquares) = struct.unpack("4I4f", decom[x*32 : (x+1)*32])
+            x += 1
+            end -= 1
+            value = sumData / (end - start) # if was quering for something else this could change
+        # bedgraph   
+        elif iType == 1:
+            (start, end, value) = struct.unpack(Enddian + "IIf", decom[24 + 12*x : 36 + 12*x])
+            end = end - 1
+        # varStep
+        elif iType == 2:
+            (start, value) = struct.unpack(Enddian + "If", decom[24 + 8*x : 32 + 8*x])
+            if x == itemCount - 1:
+                end = chromEnd - 1
+            else:
+                end = struct.unpack(Enddian + "I", decom[32 + 8*x : 36 + 8*x])[0] - 1
+        # fixStep
+        elif iType == 3:
+            value = struct.unpack("f", decom[24 + 4*x : 28 + 4*x])[0]
+            start = chromStart + x*itemStep
+            end = chromStart + (x + 1)*itemStep - 1
+        else:
+            print("bad file")
+            error()
 
-data = f.read(8)
-reserved= struct.unpack("Q", data)
-reserved = reserved[0]
-
-#64
-
-zooms = []
-for x in range(1,zoomLevels + 1):
-	zoom = {}
-	data = f.read(24)
-	(reductionLevel, reserved, dataOffest, indexOffset) = struct.unpack("=IIQQ", data)
-	zoom["level"] = x
-	zoom["reductionLevel"] = reductionLevel
-	zoom["reserved"] = reserved
-	zoom["ldataOffest"] = dataOffest
-	zoom["indexOffset"] = indexOffset
-	zooms.append(zoom)
-
-# 64 + zoomLevels * 24
-
-data = f.read(40)
-(basesCovered, minVal, maxVal, sumData, sumSquares) = struct.unpack("=Qdddd", data)
-
-# data = f.read(8)
-# basesCovered = int.from_bytes(data, byteorder = 'big', signed = False)
-# data = f.read(8)
-# minVal = int.from_bytes(data, byteorder = 'big', signed = False)
-# data = f.read(8)
-# maxVal = int.from_bytes(data, byteorder = 'big', signed = False)
-# data = f.read(8)
-# sumData = int.from_bytes(data, byteorder = 'big', signed = False)
-# data = f.read(8)
-# sumSquares = int.from_bytes(data, byteorder = 'big', signed = False)
-# print("basesCovered: " + str(basesCovered))
-# print("minVal: " + str(minVal))
-# print("maxVal: " + str(maxVal))
-# print("sumData: " + str(sumData))
-# print("sumSquares: " + str(sumSquares))
-
-# 64 + zoomLevels * 24 + 40
-
-# tree header
-data = f.read(4)
-treeMagic = struct.unpack("=I", data)
-treeMagic = treeMagic[0]
-
-data = f.read(12)
-(blockSize, keySize, valSize) = struct.unpack("=III", data)
-data = f.read(16)
-(itemCount, treeReserved) = struct.unpack("=QQ", data)
+        if start > endIndex:
+            break
+        elif endIndex - 1 <= end:
+            result.append((startIndex, endIndex - 1, value))
+            startIndex = endIndex
+        else:
+            result.append((startIndex, end, value))
+            startIndex = end + 1
 
 
-# parse 1 node
-data = f.read(4)
-(isLeaf, nodeReserved, count) = struct.unpack("BBH", data) 
+    return (startIndex, result)
 
-node = []
-for _ in range(0, count):
-	key = ""
-	for x in range(0, keySize):
-		data = f.read(1)
-		temp = struct.unpack("b", data) 
-		if chr(temp[0]) != "\x00":
-			key += chr(temp[0])
-	data = f.read(8)
-	(chromId, chromSize) = struct.unpack("II", data)
-	node.append({"key": key, "chromId": chromId, "chromSize": chromSize})
 
-# print header
-# print("magic: " + hex(magic))
-# print("version: " + hex(version))
-# print("zoomLevels: " + str(zoomLevels))
-# print("chromosomeTreeOffset: " + hex(chromosomeTreeOffset))
-# print("fullDataOffset: " + hex(fullDataOffset))
-# print("fullIndexOffset: " + hex(fullIndexOffset))
-# print("fieldCount: " + hex(fieldCount))
-# print("definedFieldCount: " + hex(definedFieldCount))
-# print("autoSqlOffset: " + hex(autoSqlOffset))
-# print("totalSummaryOffset: " + hex(totalSummaryOffset))
-# print("uncompressBufSize: " + hex(uncompressBufSize))
-# print("reserved: " + hex(reserved))
-# for zoom in zooms
-# 	print(zoom)
-# print("basesCovered: " + hex(basesCovered))
-# print("minVal: " + str(minVal))
-# print("maxVal: " + str(maxVal))
-# print("sumData: " + str(sumData))
-# print("sumSquares: " + str(sumSquares))
-# print("treeMagic: " + hex(treeMagic))
-# print("blockSize: " + str(blockSize))
-# print("keySize: " + str(keySize))
-# print("valSize: " + str(valSize))
-# print("itemCount: " + str(itemCount))
-# print("reserved: " + str(treeReserved))
-# print("isLeaf: " + str(isLeaf))
-# print("nodeReserved: " + str(nodeReserved))
-# print("count: " + str(count))
-# for item in node:
-# 	print(item)
+# returns (startIndex, [(startIndex, endIndex, average)s])
+# the returned cRange is the final endIndex - startIndex - 1
+def locateTreeAverage(f, rTree, chrmId, startIndex, endIndex):
+    offset = rTree
+    i = 0
+    node = readRtreeHeadNode(f, rTree)
+    rCount = node["rCount"]
+    isLeaf = node["rIsLeaf"]
+    while i < rCount:
+        i += 1
+        node = readRtreeNode(f, offset, isLeaf)
+        
+        # query this layer of rTree
+        # if leaf layer
+        if node["rStartChromIx"] > chrmId:
+            print(node["rStartChromIx"], chrmId)
+            print("bad chrom name or chromZone range")
+            error() # not found in tree
+        # rEndBase - 1 for inclusive range
+        elif node["rStartChromIx"] < chrmId or not (startIndex >= node["rStartBase"] and startIndex < node["rEndBase"] - 1):
+            offset = node["nextOff"]
+        else:
+            if isLeaf == 1:
+                return grepSections(f, node["rdataOffset"], node["rDataSize"], startIndex, endIndex)
+            elif isLeaf == 0:
+                # jump to next layer
+                offset = node["rdataOffset"]
+                node = readRtreeHeadNode(f, offset)
+                rCount = node["rCount"]
+                isLeaf = node["rIsLeaf"]
+                i = 0
+            else:
+                error() # bad file
 
-# parsing data
-# full data offset jumps to dataCount
-data = f.seek(fullDataOffset)
-data = f.read(4)
-dataCount = struct.unpack("I", data)
-print(dataCount)
+    # if didn't found the right intersection
+    # bad request
+    print("bad request: didn't found")
+    error()
 
-data = f.seek(fullIndexOffset)
-data = f.read(48)
-(rMagic, rBlockSize, rItemCount, rStartChromIx, rStartBase, rEndChromIx, rEndBase,
-	rEndFileOffset, rItemsPerSlot, rReserved) = struct.unpack("IIQIIIIQII", data)
-print("(rMagic, rBlockSize, rItemCount, rStartChromIx, rStartBase, rEndChromIx, rEndBase, rEndFileOffset, rItemsPerSlot, rReserved)")
-print((rMagic, rBlockSize, rItemCount, rStartChromIx, rStartBase, rEndChromIx, rEndBase,
-	rEndFileOffset, rItemsPerSlot, rReserved))
-print(fullIndexOffset + 48)
-# read 1 r tree node
-def readRtreeNode(offset):
-	f.seek(offset)
-	data = f.read(4)
-	(rIsLeaf, rReserved, rCount) = struct.unpack("BBH", data)
-	print((rIsLeaf, rReserved, rCount))
-	if rIsLeaf:
-		data = f.read(32)
-		(rStartChromIx, rStartBase, rEndChromIx, rEndBase, rdataOffset, rDataSize) = struct.unpack("IIIIQQ", data)
-		return {"rIsLeaf": rIsLeaf, "rReserved": rReserved, "rCount": rCount, "rStartChromIx": rStartChromIx, "rStartBase": rStartBase, "rEndChromIx": rEndChromIx, "rEndBase": rEndBase, "rdataOffset": rdataOffset, "rDataSize": rDataSize, "nextOff": offset + 32}
-	else:
-		data = f.read(24)
-		(rStartChromIx, rStartBase, rEndChromIx, rEndBase, rdataOffset) = struct.unpack("IIIIQ", data)
-		return {"rIsLeaf": rIsLeaf, "rReserved": rReserved, "rCount": rCount, "rStartChromIx": rStartChromIx, "rStartBase": rStartBase, "rEndChromIx": rEndChromIx, "rEndBase": rEndBase, "rdataOffset": rdataOffset, "nextOff": offset + 24}
+# parameter: array of (start, end, value)
+# return: mean of the values
+def averageOfArray(chromArray):
+    count = 0
+    value = 0.0
+    for section in chromArray:
+        count += section[1] - section[0] + 1
+        value += (section[1] - section[0] + 1) * section[2]
+    # this shouldn't happen, the error should be thrown else where
+    # instead of reaching here
+    if count == 0:
+        print("bad range")
+        error()
+    return value/count
 
-print(readRtreeNode(fullIndexOffset + 48))
-print(readRtreeNode(fullIndexOffset + 48 + 24))
-print(readRtreeNode(583410880))
-print(readRtreeNode(583423176))
+def getId(f, chromTreeOffset, chrmzone):
+    f.seek(chromTreeOffset)
+    data = f.read(4)
+    treeMagic = struct.unpack(Enddian + "I", data)
+    treeMagic = treeMagic[0]
 
-data = f.seek(713)
-data = f.read(4373)
-decom = zlib.decompress(data)
-header = decom[:24]
+    data = f.read(12)
+    (blockSize, keySize, valSize) = struct.unpack(Enddian + "III", data)
+    data = f.read(16)
+    (itemCount, treeReserved) = struct.unpack(Enddian + "QQ", data)
+    data = f.read(4)
 
-print(struct.unpack("IIIIIBBH", header))
-print(struct.unpack("IIf", decom[24:36]))
-print(struct.unpack("IIf", decom[36:48]))
+    chrmId = -1
+    (isLeaf, nodeReserved, count) = struct.unpack(Enddian + "BBH", data) 
+    for y in range(0, count):
+        key = ""
+        for x in range(0, keySize):
+            data = f.read(1)
+            temp = struct.unpack(Enddian + "b", data) 
+            if chr(temp[0]) != "\x00":
+                key += chr(temp[0])
+        if isLeaf == 1:
+            data = f.read(8)
+            (chromId, chromSize) = struct.unpack(Enddian + "II", data)
+            if key == chrmzone:
+                chrmId = chromId
+    if chrmId == -1:
+        print("error")
+        exit() # need to handle error
+    return chrmId
 
+def getZoom(f, startIndex, endIndex, step):
+    f.seek(0)
+    data = f.read(8)
+    (_, _, zoomLevels) = struct.unpack(Enddian + "IHH", data)
+    f.seek(64)
+    offset = 0
+    distance = step**2
+    for x in range(1, zoomLevels + 1):
+        data = f.read(24)
+        (reductionLevel, reserved, dataOffest, indexOffset) = struct.unpack("=IIQQ", data)
+        newDis = ((reductionLevel - step)*1.0) ** 2
+        if newDis < distance:
+            distance = newDis
+            offset = indexOffset
+    return offset
+
+
+# end needs to be greater than start
 def aveBigWig(f, chrmzone, startIndex, endIndex):
-	f.seek(0)
-	data = f.read(36)
-	(magic, version, zoomLevels, chromosomeTreeOffset, fullDataOffset, fullIndexOffset,
-		fieldCount, definedFieldCount) = struct.unpack("=IHHQQQHH", data)
-	f.seek(chromosomeTreeOffset)
-	data = f.read(4)
-	chrmId = -1
-	(isLeaf, nodeReserved, count) = struct.unpack("BBH", data) 
-	for _ in range(0, count):
-		key = ""
-		for x in range(0, keySize):
-			data = f.read(1)
-			temp = struct.unpack("b", data) 
-			if chr(temp[0]) != "\x00":
-				key += chr(temp[0])
-		data = f.read(8)
-		(chromId, chromSize) = struct.unpack("II", data)
-		if key == chrmzone:
-			chrmId = chromId
-	if chrmId == -1:
-		print("error")
-		exit() # need to handle error
-	offset = fullIndexOffset
-	while 1:
-		node = readRtreeNode(offset)
-		layerSize = node[rCount]
-		for _ in xrange(1,rCount):
-			if node[rEndChromIx] >= chrmId && node[rStartChromIx] <= chrmId:
-				break;
-			else:
-				node = readRtreeNode(node[nextOff])
-		if node[rIsLeaf] == 1:
-			break
+    f.seek(0)
+    data = f.read(36)
+    (magic, version, zoomLevels, chromTreeOffset, fullDataOffset, fullIndexOffset,
+        fieldCount, definedFieldCount) = struct.unpack(Enddian + "IHHQQQHH", data)
 
+    data = f.read(20)
+    (autoSqlOffset, totalSummaryOffset, uncompressBufSize) = struct.unpack(Enddian + "QQI", data)
+    if uncompressBufSize == 0:
+        compressed = False
 
+    chrmId = getId(f, chromTreeOffset, chrmzone)
 
+    chromArray = []
+    headNodeOffset = zoomOffset + 48 if zoomOffset else fullIndexOffset + 48
+    while startIndex < endIndex:
+        (startIndex, sections) = locateTreeAverage(f, headNodeOffset, chrmId, startIndex, endIndex)
+        for section in sections:
+            chromArray.append(section)
+    
+    return averageOfArray(chromArray)
 
-def readBioFile(file, chrmzone, startIndex, endIndex):
-	f = open(file, "rb")
-	if struct.unpack("I", f.read(4))[0] == int("0x888FFC26", 0):
-	 	aveBigWig(f, chrmzone, startIndex, endIndex)
-	f.close()
+def readBioFile(f, chrmzone, startIndex, endIndex):
+    f.seek(0)
+    global Enddian
+    if struct.unpack("I", f.read(4))[0] == int("0x888FFC26", 0):
+        mean = aveBigWig(f, chrmzone, startIndex, endIndex)
+    elif struct.unpack("<I", f.read(4))[0] == int("0x888FFC26", 0):
+        Enddian = "<"
+        mean = aveBigWig(f, chrmzone, startIndex, endIndex)
+    else:
+        print("unsupported file type")
+        error()
+    return mean
 
+# the endIndex is exclusive
+def getRange(file, chrmzone, startIndex, endIndex, points):
+    global zoomOffset
+    if startIndex == endIndex:
+        print("wrong indecies")
+    f = open(file, "rb")
+    step = (endIndex - startIndex)*1.0/points
+    zoomOffset = getZoom(f, startIndex, endIndex, step)
+    mean = []
+    while startIndex < endIndex:
+        end = startIndex + step 
+        end = endIndex if (endIndex - end) < step else end
+        mean.append(readBioFile(f, chrmzone, startIndex, end))
+        startIndex = end
 
+    f.close()
+    return mean
+
+# print(getRange("39033.bigwig", "chrY", 0, 30, 2))
